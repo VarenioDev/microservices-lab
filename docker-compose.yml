@@ -5,6 +5,8 @@ services:
     image: consul:1.15
     ports:
       - "8500:8500"
+    volumes:
+      - consul-data:/consul/data
     networks:
       - microservices-net
 
@@ -28,6 +30,16 @@ services:
       consul:
         condition: service_started
 
+  service-discovery:
+    build: ./service-discovery
+    ports:
+      - "5004:5004"
+    networks:
+      - microservices-net
+    depends_on:
+      consul:
+        condition: service_started
+
   nginx:
     image: nginx:alpine
     ports:
@@ -41,7 +53,12 @@ services:
         condition: service_started
       catalog-service:
         condition: service_started
+      service-discovery:
+        condition: service_started
 
 networks:
   microservices-net:
     driver: bridge
+
+volumes:
+  consul-data:
