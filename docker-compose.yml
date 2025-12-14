@@ -1,10 +1,12 @@
-version: '3.8'
+﻿version: '3.8'
 
 services:
   consul:
     image: consul:1.15
     ports:
       - "8500:8500"
+    volumes:
+      - consul-data:/consul/data
     networks:
       - microservices-net
 
@@ -28,7 +30,7 @@ services:
       consul:
         condition: service_started
 
-  payment-service:          ← НОВЫЙ СЕРВИС
+  payment-service:
     build: ./payment-service
     ports:
       - "5003:5000"
@@ -37,10 +39,20 @@ services:
     depends_on:
       consul:
         condition: service_started
-    environment:            ← ПЕРЕМЕННЫЕ ДЛЯ ПЛАТЕЖНЫХ СИСТЕМ
+    environment:
       - STRIPE_SECRET_KEY=${STRIPE_SECRET_KEY:-sk_test_xxx}
       - STRIPE_WEBHOOK_SECRET=${STRIPE_WEBHOOK_SECRET:-whsec_xxx}
       - YOOMONEY_WALLET=${YOOMONEY_WALLET:-410011111111111}
+
+  service-discovery:
+    build: ./service-discovery
+    ports:
+      - "5004:5004"
+    networks:
+      - microservices-net
+    depends_on:
+      consul:
+        condition: service_started
 
   nginx:
     image: nginx:alpine
@@ -53,8 +65,12 @@ services:
     depends_on:
       - auth-service
       - catalog-service
-      - payment-service    ← ДОБАВИТЬ ЗАВИСИМОСТЬ
+      - payment-service
+      - service-discovery
 
 networks:
   microservices-net:
     driver: bridge
+
+volumes:
+  consul-data:
