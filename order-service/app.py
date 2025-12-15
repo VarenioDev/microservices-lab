@@ -4,6 +4,11 @@ from typing import List, Optional, Dict, Any
 import uuid
 from datetime import datetime
 from models import OrderCreate, OrderUpdate, OrderResponse, UserOrdersResponse, OrderStatus, PaymentStatus
+import asyncio
+import json
+import os
+import aio_pika
+import httpx
 
 app = FastAPI(
     title="Order Service API",
@@ -25,6 +30,70 @@ app.add_middleware(
 
 # Временное хранилище заказов
 orders_db: Dict[str, dict] = {}
+
+# RabbitMQ connection (initialized on startup)
+RABBITMQ_URL = os.getenv("RABBITMQ_URL", "amqp://guest:guest@rabbitmq:5672/")
+_rabbit_connection = None
+_rabbit_channel = None
+
+async def publish_event(routing_key: str, message: dict):
+    """Publish an event to the 'events' exchange"""
+    global _rabbit_connection, _rabbit_channel
+    if _rabbit_channel is None:
+        return
+    body = json.dumps(message).encode()
+    await _rabbit_channel.default_exchange.publish(
+        aio_pika.Message(body=body, content_type="application/json"),
+        routing_key=routing_key
+    )
+
+async def _on_payment_event(message: aio_pika.IncomingMessage):
+    async with message.process():
+        try:
+            payload = json.loads(message.body.decode())
+            routing = message.routing_key
+            order_id = payload.get("order_id")
+            if not order_id or order_id not in orders_db:
+                print(f"Payment event for unknown order {order_id}")
+                return
+
+            order = orders_db[order_id]
+            if routing == "payment.succeeded":
+                order["payment_status"] = PaymentStatus.PAID.value
+                order["status"] = OrderStatus.PROCESSING.value
+                order["updated_at"] = get_current_time()
+                print(f"Order {order_id} marked as PAID")
+            elif routing == "payment.failed":
+                order["payment_status"] = PaymentStatus.FAILED.value
+                order["status"] = OrderStatus.CANCELLED.value
+                order["updated_at"] = get_current_time()
+                print(f"Order {order_id} cancelled due to payment failure")
+                # publish compensation event
+                await publish_event("order.cancelled", {"order_id": order_id, "reason": payload.get("reason")})
+        except Exception as e:
+            print(f"Error handling payment event: {e}")
+
+async def start_rabbitmq():
+    global _rabbit_connection, _rabbit_channel
+    try:
+        _rabbit_connection = await aio_pika.connect_robust(RABBITMQ_URL)
+        _rabbit_channel = await _rabbit_connection.channel()
+
+        # declare topic exchange
+        await _rabbit_channel.declare_exchange("events", aio_pika.ExchangeType.TOPIC)
+
+        # declare a queue for payment events
+        queue = await _rabbit_channel.declare_queue("order-service.payment-events", durable=True)
+        await queue.bind("events", routing_key="payment.*")
+        await queue.consume(_on_payment_event)
+        print("Order-service connected to RabbitMQ and consuming payment events")
+    except Exception as e:
+        print(f"Could not connect to RabbitMQ: {e}")
+
+async def stop_rabbitmq():
+    global _rabbit_connection
+    if _rabbit_connection:
+        await _rabbit_connection.close()
 
 # Helper функции
 def generate_order_id():
@@ -106,6 +175,14 @@ async def create_order(order_data: OrderCreate):
     }
     
     orders_db[order_id] = new_order
+    # publish order.created event for saga choreography
+    asyncio.create_task(publish_event("order.created", {
+        "order_id": order_id,
+        "user_id": order_data.user_id,
+        "total_amount": total_amount,
+        "items": items_dict,
+        "shipping_address": order_data.shipping_address
+    }))
     return new_order
 
 @app.put("/api/v1/orders/{order_id}", response_model=OrderResponse)
@@ -168,3 +245,15 @@ async def root():
         "docs": "/api/docs",
         "total_orders": len(orders_db)
     }
+
+
+# Startup / Shutdown events for RabbitMQ
+@app.on_event("startup")
+async def on_startup():
+    # wait a short time for rabbitmq to be available in compose startup order
+    await asyncio.sleep(2)
+    await start_rabbitmq()
+
+@app.on_event("shutdown")
+async def on_shutdown():
+    await stop_rabbitmq()

@@ -4,6 +4,10 @@ from typing import Dict, Any
 import os
 from models import PaymentCreate
 from payment_gateways import StripeGateway, YooMoneyGateway
+import asyncio
+import json
+import aio_pika
+import random
 
 app = FastAPI(title="Payment Service", version="1.0.0")
 
@@ -19,6 +23,68 @@ app.add_middleware(
 # Инициализация платежных шлюзов
 stripe_gateway = StripeGateway()
 yoomoney_gateway = YooMoneyGateway()
+
+# RabbitMQ settings
+RABBITMQ_URL = os.getenv("RABBITMQ_URL", "amqp://guest:guest@rabbitmq:5672/")
+_rabbit_connection = None
+_rabbit_channel = None
+
+async def publish_event(routing_key: str, message: dict):
+    global _rabbit_channel
+    if _rabbit_channel is None:
+        return
+    body = json.dumps(message).encode()
+    await _rabbit_channel.default_exchange.publish(
+        aio_pika.Message(body=body, content_type="application/json"),
+        routing_key=routing_key
+    )
+
+async def _on_order_created(message: aio_pika.IncomingMessage):
+    async with message.process():
+        try:
+            payload = json.loads(message.body.decode())
+            order_id = payload.get("order_id")
+            amount = payload.get("total_amount")
+            user_id = payload.get("user_id")
+            # Simulate payment processing (random success/failure)
+            await asyncio.sleep(1)
+            success = random.random() < 0.9
+            payment_id = f"PAY-{order_id[-8:]}"
+            if success:
+                await publish_event("payment.succeeded", {
+                    "order_id": order_id,
+                    "payment_id": payment_id,
+                    "amount": amount
+                })
+                print(f"Payment succeeded for {order_id}")
+            else:
+                await publish_event("payment.failed", {
+                    "order_id": order_id,
+                    "payment_id": payment_id,
+                    "amount": amount,
+                    "reason": "simulated_failure"
+                })
+                print(f"Payment failed for {order_id}")
+        except Exception as e:
+            print(f"Error processing order.created: {e}")
+
+async def start_rabbitmq():
+    global _rabbit_connection, _rabbit_channel
+    try:
+        _rabbit_connection = await aio_pika.connect_robust(RABBITMQ_URL)
+        _rabbit_channel = await _rabbit_connection.channel()
+        await _rabbit_channel.declare_exchange("events", aio_pika.ExchangeType.TOPIC)
+        queue = await _rabbit_channel.declare_queue("payment-service.order-created", durable=True)
+        await queue.bind("events", routing_key="order.created")
+        await queue.consume(_on_order_created)
+        print("Payment-service connected to RabbitMQ and consuming order.created events")
+    except Exception as e:
+        print(f"Could not connect to RabbitMQ: {e}")
+
+async def stop_rabbitmq():
+    global _rabbit_connection
+    if _rabbit_connection:
+        await _rabbit_connection.close()
 
 @app.post("/create", response_model=Dict[str, Any])
 async def create_payment(payment_data: PaymentCreate):
@@ -122,6 +188,17 @@ async def yoomoney_webhook(request: Request):
         # Обновление статуса заказа
     
     return {"success": True}
+
+
+# Startup / Shutdown for RabbitMQ
+@app.on_event("startup")
+async def on_startup():
+    await asyncio.sleep(2)
+    await start_rabbitmq()
+
+@app.on_event("shutdown")
+async def on_shutdown():
+    await stop_rabbitmq()
 
 # Health check для Consul
 @app.get("/health")

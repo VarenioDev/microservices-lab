@@ -65,6 +65,28 @@ services:
       - catalog-service
       - order-service
       - payment-service
+    
+  rabbitmq:
+    image: rabbitmq:3-management
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    networks:
+      - microservices-net
+    healthcheck:
+      test: ["CMD", "rabbitmqctl", "status"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  notification-service:
+    build: ./notification-service
+    ports:
+      - "5006:5006"
+    networks:
+      - microservices-net
+    depends_on:
+      - rabbitmq
 
   nginx:
     image: nginx:alpine
