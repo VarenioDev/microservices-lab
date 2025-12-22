@@ -1,14 +1,17 @@
-from fastapi import FastAPI, HTTPException, Query, Depends, status
+from fastapi import FastAPI, HTTPException, Query, Depends, status, Request
 from fastapi.middleware.cors import CORSMiddleware
 from typing import List, Optional, Dict, Any
 import uuid
 from datetime import datetime
-from models import OrderCreate, OrderUpdate, OrderResponse, UserOrdersResponse, OrderStatus, PaymentStatus
 import asyncio
 import json
 import os
 import aio_pika
 import httpx
+import time
+
+from models import OrderCreate, OrderUpdate, OrderResponse, UserOrdersResponse, OrderStatus, PaymentStatus
+from prometheus_fastapi_instrumentator import Instrumentator
 
 app = FastAPI(
     title="Order Service API",
@@ -31,16 +34,29 @@ app.add_middleware(
 # Временное хранилище заказов
 orders_db: Dict[str, dict] = {}
 
-# RabbitMQ connection (initialized on startup)
+# RabbitMQ connection
 RABBITMQ_URL = os.getenv("RABBITMQ_URL", "amqp://guest:guest@rabbitmq:5672/")
 _rabbit_connection = None
 _rabbit_channel = None
+
+# Middleware для логирования
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    start_time = time.time()
+    
+    response = await call_next(request)
+    
+    process_time = (time.time() - start_time) * 1000
+    print(f"{request.method} {request.url.path} - Status: {response.status_code} - Duration: {process_time:.2f}ms")
+    
+    return response
 
 async def publish_event(routing_key: str, message: dict):
     """Publish an event to the 'events' exchange"""
     global _rabbit_connection, _rabbit_channel
     if _rabbit_channel is None:
         return
+    
     body = json.dumps(message).encode()
     await _rabbit_channel.default_exchange.publish(
         aio_pika.Message(body=body, content_type="application/json"),
@@ -68,7 +84,6 @@ async def _on_payment_event(message: aio_pika.IncomingMessage):
                 order["status"] = OrderStatus.CANCELLED.value
                 order["updated_at"] = get_current_time()
                 print(f"Order {order_id} cancelled due to payment failure")
-                # publish compensation event
                 await publish_event("order.cancelled", {"order_id": order_id, "reason": payload.get("reason")})
         except Exception as e:
             print(f"Error handling payment event: {e}")
@@ -79,10 +94,8 @@ async def start_rabbitmq():
         _rabbit_connection = await aio_pika.connect_robust(RABBITMQ_URL)
         _rabbit_channel = await _rabbit_connection.channel()
 
-        # declare topic exchange
         await _rabbit_channel.declare_exchange("events", aio_pika.ExchangeType.TOPIC)
 
-        # declare a queue for payment events
         queue = await _rabbit_channel.declare_queue("order-service.payment-events", durable=True)
         await queue.bind("events", routing_key="payment.*")
         await queue.consume(_on_payment_event)
@@ -155,7 +168,6 @@ async def create_order(order_data: OrderCreate):
     order_id = generate_order_id()
     current_time = get_current_time()
     
-    # Рассчитываем общую сумму
     items_dict = [item.dict() for item in order_data.items]
     total_amount = calculate_total(items_dict)
     
@@ -175,7 +187,6 @@ async def create_order(order_data: OrderCreate):
     }
     
     orders_db[order_id] = new_order
-    # publish order.created event for saga choreography
     asyncio.create_task(publish_event("order.created", {
         "order_id": order_id,
         "user_id": order_data.user_id,
@@ -193,7 +204,6 @@ async def update_order(order_id: str, order_update: OrderUpdate):
     
     order = orders_db[order_id]
     
-    # Обновляем только переданные поля
     update_data = order_update.dict(exclude_unset=True)
     for field, value in update_data.items():
         if value is not None:
@@ -229,6 +239,13 @@ async def get_order_items(order_id: str):
         "total_amount": order["total_amount"]
     }
 
+# Метрики для Prometheus
+@app.get("/metrics")
+async def metrics():
+    """Эндпоинт для метрик Prometheus"""
+    # Эта функция будет автоматически инструментирована prometheus-fastapi-instrumentator
+    pass
+
 # Health check
 @app.get("/health")
 async def health_check():
@@ -246,11 +263,13 @@ async def root():
         "total_orders": len(orders_db)
     }
 
-
-# Startup / Shutdown events for RabbitMQ
+# Startup / Shutdown events
 @app.on_event("startup")
 async def on_startup():
-    # wait a short time for rabbitmq to be available in compose startup order
+    # Инициализация Prometheus метрик
+    Instrumentator().instrument(app).expose(app)
+    
+    # RabbitMQ подключение
     await asyncio.sleep(2)
     await start_rabbitmq()
 

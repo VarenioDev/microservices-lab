@@ -4,3 +4,4 @@ pydantic==2.5.0
 python-multipart==0.0.6
 aio-pika==9.5.8
 httpx==0.25.1
+prometheus-fastapi-instrumentator==6.0.0
