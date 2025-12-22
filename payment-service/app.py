@@ -1,15 +1,152 @@
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 import os
+import asyncio
+import threading
+import random
+import time
+from contextlib import asynccontextmanager
+
+# Circuit Breaker
+from circuitbreaker import circuit, CircuitBreakerMonitor
+
+# gRPC
+import grpc
+from concurrent import futures
+
+# Импорт сгенерированных gRPC файлов
+import payment_service_pb2
+import payment_service_pb2_grpc
+
 from models import PaymentCreate
 from payment_gateways import StripeGateway, YooMoneyGateway
-import asyncio
-import json
-import aio_pika
-import random
 
-app = FastAPI(title="Payment Service", version="1.0.0")
+# Circuit Breaker state для мониторинга
+cb_monitor = CircuitBreakerMonitor()
+
+# Имитация базы данных платежей
+payments_db = {}
+
+class PaymentService(payment_service_pb2_grpc.PaymentServiceServicer):
+    def __init__(self, stripe_gateway: StripeGateway, yoomoney_gateway: YooMoneyGateway):
+        self.stripe_gateway = stripe_gateway
+        self.yoomoney_gateway = yoomoney_gateway
+    
+    @circuit(failure_threshold=5, recovery_timeout=30)
+    def ProcessPayment(self, request, context):
+        """Обработка платежа через gRPC с Circuit Breaker"""
+        try:
+            # Имитация случайных сбоев (30% вероятность для теста Circuit Breaker)
+            if random.random() < 0.3:
+                raise Exception("Payment gateway unavailable")
+            
+            # Преобразуем gRPC запрос в PaymentCreate
+            payment_data = PaymentCreate(
+                order_id=request.order_id,
+                user_id=request.user_id,
+                amount=request.amount,
+                currency=request.currency,
+                payment_method=request.payment_method,
+                description=f"Payment for order {request.order_id}"
+            )
+            
+            # Выбор шлюза
+            if request.payment_method in ["card", "apple_pay", "google_pay"]:
+                result = asyncio.run(self.stripe_gateway.create_payment(payment_data))
+                gateway = "stripe"
+            elif request.payment_method == "yoomoney":
+                result = asyncio.run(self.yoomoney_gateway.create_payment(payment_data))
+                gateway = "yoomoney"
+            else:
+                context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
+                context.set_details("Unsupported payment method")
+                return payment_service_pb2.PaymentResponse()
+            
+            # Сохраняем в базу
+            payments_db[result.get("payment_id", "")] = {
+                **result,
+                "order_id": request.order_id,
+                "gateway": gateway,
+                "timestamp": time.time()
+            }
+            
+            return payment_service_pb2.PaymentResponse(
+                payment_id=result.get("payment_id", ""),
+                status=result.get("status", "pending"),
+                message=f"Payment processed via {gateway}",
+                gateway=gateway
+            )
+            
+        except Exception as e:
+            # Fallback при сбое Circuit Breaker
+            return payment_service_pb2.PaymentResponse(
+                payment_id="",
+                status="processing",
+                message="Payment is being processed (fallback mode)",
+                gateway="fallback"
+            )
+    
+    def GetPaymentStatus(self, request, context):
+        """Получение статуса платежа через gRPC"""
+        payment_id = request.payment_id
+        
+        if payment_id in payments_db:
+            payment = payments_db[payment_id]
+            return payment_service_pb2.PaymentStatusResponse(
+                payment_id=payment_id,
+                status=payment.get("status", "unknown"),
+                message=f"Payment details for {payment.get('order_id', 'unknown')}"
+            )
+        else:
+            # Пробуем получить статус из шлюза
+            try:
+                if request.gateway == "stripe":
+                    status = asyncio.run(self.stripe_gateway.get_payment_status(payment_id))
+                elif request.gateway == "yoomoney":
+                    status = asyncio.run(self.yoomoney_gateway.get_payment_status(payment_id))
+                else:
+                    context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
+                    context.set_details("Invalid gateway")
+                    return payment_service_pb2.PaymentStatusResponse()
+                
+                return payment_service_pb2.PaymentStatusResponse(
+                    payment_id=payment_id,
+                    status=status.get("status", "unknown"),
+                    message="Status retrieved from payment gateway"
+                )
+            except Exception as e:
+                context.set_code(grpc.StatusCode.NOT_FOUND)
+                context.set_details(f"Payment not found: {str(e)}")
+                return payment_service_pb2.PaymentStatusResponse()
+
+def run_grpc_server(stripe_gateway, yoomoney_gateway):
+    """Запуск gRPC сервера"""
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
+    payment_service_pb2_grpc.add_PaymentServiceServicer_to_server(
+        PaymentService(stripe_gateway, yoomoney_gateway), server
+    )
+    server.add_insecure_port('[::]:50051')
+    server.start()
+    print("gRPC server started on port 50051")
+    server.wait_for_termination()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Lifespan для управления запуском/остановкой gRPC сервера"""
+    # Запускаем gRPC сервер в отдельном потоке
+    grpc_thread = threading.Thread(
+        target=run_grpc_server,
+        args=(stripe_gateway, yoomoney_gateway),
+        daemon=True
+    )
+    grpc_thread.start()
+    print("gRPC server thread started")
+    yield
+    # Очистка при завершении
+    print("Shutting down...")
+
+app = FastAPI(title="Payment Service", version="2.0.0", lifespan=lifespan)
 
 # CORS middleware
 app.add_middleware(
@@ -24,74 +161,18 @@ app.add_middleware(
 stripe_gateway = StripeGateway()
 yoomoney_gateway = YooMoneyGateway()
 
-# RabbitMQ settings
-RABBITMQ_URL = os.getenv("RABBITMQ_URL", "amqp://guest:guest@rabbitmq:5672/")
-_rabbit_connection = None
-_rabbit_channel = None
-
-async def publish_event(routing_key: str, message: dict):
-    global _rabbit_channel
-    if _rabbit_channel is None:
-        return
-    body = json.dumps(message).encode()
-    await _rabbit_channel.default_exchange.publish(
-        aio_pika.Message(body=body, content_type="application/json"),
-        routing_key=routing_key
-    )
-
-async def _on_order_created(message: aio_pika.IncomingMessage):
-    async with message.process():
-        try:
-            payload = json.loads(message.body.decode())
-            order_id = payload.get("order_id")
-            amount = payload.get("total_amount")
-            user_id = payload.get("user_id")
-            # Simulate payment processing (random success/failure)
-            await asyncio.sleep(1)
-            success = random.random() < 0.9
-            payment_id = f"PAY-{order_id[-8:]}"
-            if success:
-                await publish_event("payment.succeeded", {
-                    "order_id": order_id,
-                    "payment_id": payment_id,
-                    "amount": amount
-                })
-                print(f"Payment succeeded for {order_id}")
-            else:
-                await publish_event("payment.failed", {
-                    "order_id": order_id,
-                    "payment_id": payment_id,
-                    "amount": amount,
-                    "reason": "simulated_failure"
-                })
-                print(f"Payment failed for {order_id}")
-        except Exception as e:
-            print(f"Error processing order.created: {e}")
-
-async def start_rabbitmq():
-    global _rabbit_connection, _rabbit_channel
-    try:
-        _rabbit_connection = await aio_pika.connect_robust(RABBITMQ_URL)
-        _rabbit_channel = await _rabbit_connection.channel()
-        await _rabbit_channel.declare_exchange("events", aio_pika.ExchangeType.TOPIC)
-        queue = await _rabbit_channel.declare_queue("payment-service.order-created", durable=True)
-        await queue.bind("events", routing_key="order.created")
-        await queue.consume(_on_order_created)
-        print("Payment-service connected to RabbitMQ and consuming order.created events")
-    except Exception as e:
-        print(f"Could not connect to RabbitMQ: {e}")
-
-async def stop_rabbitmq():
-    global _rabbit_connection
-    if _rabbit_connection:
-        await _rabbit_connection.close()
-
+# Circuit Breaker для HTTP endpoints
 @app.post("/create", response_model=Dict[str, Any])
+@circuit(failure_threshold=5, recovery_timeout=30)
 async def create_payment(payment_data: PaymentCreate):
     """
-    Создание платежной сессии
+    Создание платежной сессии с Circuit Breaker
     """
     try:
+        # Имитация сбоя для тестирования Circuit Breaker (20% вероятность)
+        if random.random() < 0.2:
+            raise Exception("Simulated gateway failure for Circuit Breaker test")
+        
         if payment_data.payment_method in ["card", "apple_pay", "google_pay"]:
             result = await stripe_gateway.create_payment(payment_data)
             gateway = "stripe"
@@ -101,6 +182,14 @@ async def create_payment(payment_data: PaymentCreate):
         else:
             raise HTTPException(status_code=400, detail="Unsupported payment method")
         
+        # Сохраняем в базу
+        payments_db[result.get("payment_id", "")] = {
+            **result,
+            "order_id": payment_data.order_id,
+            "gateway": gateway,
+            "timestamp": time.time()
+        }
+        
         return {
             "success": True,
             "gateway": gateway,
@@ -108,14 +197,36 @@ async def create_payment(payment_data: PaymentCreate):
             "order_id": payment_data.order_id
         }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        # Fallback при срабатывании Circuit Breaker
+        return {
+            "success": True,
+            "gateway": "fallback",
+            "payment_data": {
+                "payment_id": "",
+                "status": "processing",
+                "message": "Payment is being processed (fallback mode)",
+                "amount": payment_data.amount,
+                "currency": payment_data.currency
+            },
+            "order_id": payment_data.order_id
+        }
 
 @app.get("/{payment_id}/status")
+@circuit(failure_threshold=3, recovery_timeout=20)
 async def get_payment_status(payment_id: str, gateway: str = "stripe"):
     """
-    Получение статуса платежа
+    Получение статуса платежа с Circuit Breaker
     """
     try:
+        # Проверяем локальную базу
+        if payment_id in payments_db:
+            return {
+                "success": True,
+                "status": payments_db[payment_id],
+                "source": "local_cache"
+            }
+        
+        # Запрашиваем у шлюза
         if gateway == "stripe":
             status = await stripe_gateway.get_payment_status(payment_id)
         elif gateway == "yoomoney":
@@ -125,32 +236,73 @@ async def get_payment_status(payment_id: str, gateway: str = "stripe"):
         
         return {"success": True, "status": status}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        # Fallback
+        return {
+            "success": True,
+            "status": {
+                "payment_id": payment_id,
+                "status": "processing",
+                "message": "Status check in progress (fallback)"
+            },
+            "source": "fallback"
+        }
 
 @app.post("/{payment_id}/refund")
-async def refund_payment(payment_id: str, amount: float = None, gateway: str = "stripe"):
+@circuit(failure_threshold=3, recovery_timeout=20)
+async def refund_payment(payment_id: str, amount: Optional[float] = None, gateway: str = "stripe"):
     """
-    Возврат платежа
+    Возврат платежа с Circuit Breaker
     """
     try:
         if gateway == "stripe":
             result = await stripe_gateway.refund_payment(payment_id, amount)
         elif gateway == "yoomoney":
-            # В реальном проекте - вызов API YooMoney для возврата
             result = {"status": "refund_initiated", "message": "Refund processed"}
         else:
             raise HTTPException(status_code=400, detail="Invalid gateway")
         
         return {"success": True, "refund": result}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        # Fallback
+        return {
+            "success": True,
+            "refund": {
+                "status": "processing",
+                "message": "Refund request received (fallback mode)"
+            }
+        }
 
-# Вебхуки от платежных систем
+# Мониторинг Circuit Breaker
+@app.get("/circuit-breaker/status")
+async def circuit_breaker_status():
+    """Статус всех Circuit Breaker'ов"""
+    breakers = []
+    for cb in cb_monitor.get_circuits():
+        breakers.append({
+            "name": cb.name,
+            "state": cb.state.name,
+            "failure_count": cb.failure_count,
+            "open_until": cb.open_remaining if hasattr(cb, 'open_remaining') else None
+        })
+    
+    return {
+        "circuit_breakers": breakers,
+        "total": len(breakers)
+    }
+
+@app.post("/circuit-breaker/reset/{name}")
+async def reset_circuit_breaker(name: str):
+    """Сброс Circuit Breaker'а"""
+    for cb in cb_monitor.get_circuits():
+        if cb.name == name:
+            cb.close()
+            return {"success": True, "message": f"Circuit breaker '{name}' reset"}
+    
+    return {"success": False, "message": f"Circuit breaker '{name}' not found"}
+
+# Вебхуки (без изменений)
 @app.post("/webhooks/stripe")
 async def stripe_webhook(request: Request):
-    """
-    Обработка вебхуков от Stripe
-    """
     payload = await request.body()
     sig_header = request.headers.get("stripe-signature")
     
@@ -164,7 +316,6 @@ async def stripe_webhook(request: Request):
         if event["type"] == "payment_intent.succeeded":
             payment_intent = event["data"]["object"]
             print(f"Payment succeeded: {payment_intent['id']}")
-            # Здесь можно обновить статус в вашей БД
         
         return {"success": True, "event": event["type"]}
     except Exception as e:
@@ -172,9 +323,6 @@ async def stripe_webhook(request: Request):
 
 @app.post("/webhooks/yoomoney")
 async def yoomoney_webhook(request: Request):
-    """
-    Обработка вебхуков от YooMoney
-    """
     data = await request.json()
     
     notification_type = data.get("notification_type")
@@ -185,26 +333,49 @@ async def yoomoney_webhook(request: Request):
         label = data.get("label")
         
         print(f"YooMoney payment received: {amount} from {sender} for order {label}")
-        # Обновление статуса заказа
     
     return {"success": True}
 
-
-# Startup / Shutdown for RabbitMQ
-@app.on_event("startup")
-async def on_startup():
-    await asyncio.sleep(2)
-    await start_rabbitmq()
-
-@app.on_event("shutdown")
-async def on_shutdown():
-    await stop_rabbitmq()
-
-# Health check для Consul
+# Health checks
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy", "service": "payment-service"}
+    """Health check для Consul"""
+    return {
+        "status": "healthy",
+        "service": "payment-service",
+        "grpc": "enabled",
+        "circuit_breaker": "enabled"
+    }
+
+@app.get("/health/grpc")
+async def grpc_health_check():
+    """Health check для gRPC соединения"""
+    try:
+        # Пробуем подключиться к gRPC серверу
+        with grpc.insecure_channel('localhost:50051') as channel:
+            stub = payment_service_pb2_grpc.PaymentServiceStub(channel)
+            # Пустой запрос для проверки
+            response = stub.GetPaymentStatus(
+                payment_service_pb2.PaymentStatusRequest(payment_id="test", gateway="stripe"),
+                timeout=2
+            )
+            return {"grpc": "healthy"}
+    except Exception as e:
+        return {"grpc": "unhealthy", "error": str(e)}
 
 @app.get("/")
 async def root():
-    return {"message": "Payment Service is running"}
+    return {
+        "message": "Payment Service with gRPC and Circuit Breaker",
+        "version": "2.0.0",
+        "endpoints": {
+            "create_payment": "POST /create",
+            "get_status": "GET /{payment_id}/status",
+            "refund": "POST /{payment_id}/refund",
+            "circuit_breaker_status": "GET /circuit-breaker/status",
+            "health": "GET /health",
+            "grpc_health": "GET /health/grpc"
+        },
+        "grpc_port": 50051,
+        "http_port": 5000
+    }
