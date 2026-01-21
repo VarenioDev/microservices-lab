@@ -29,6 +29,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Initialize Instrumentator at module level
+Instrumentator().instrument(app).expose(app)
+
 orders_db: Dict[str, dict] = {}
 
 RABBITMQ_URL = os.getenv("RABBITMQ_URL", "amqp://guest:guest@rabbitmq:5672/")
@@ -260,7 +263,6 @@ async def root():
 
 @app.on_event("startup")
 async def on_startup():
-    Instrumentator().instrument(app).expose(app)
     await asyncio.sleep(2)
     await start_rabbitmq()
 
