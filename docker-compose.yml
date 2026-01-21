@@ -1,4 +1,4 @@
-﻿services:
+services:
   consul:
     image: consul:1.15
     ports:
@@ -43,7 +43,6 @@
     build: ./payment-service
     ports:
       - "5003:5000"
-      - "50051:50051"
     networks:
       - microservices-net
     depends_on:
@@ -64,9 +63,6 @@
       - catalog-service
       - auth-service
       - payment-service
-    environment:
-      - PAYMENT_SERVICE_GRPC_HOST=payment-service
-      - PAYMENT_SERVICE_GRPC_PORT=50051
 
   graphql-gateway:
     build: ./graphql-gateway
@@ -118,9 +114,6 @@
       - order-service
       - graphql-gateway
 
-  # ========== MONITORING STACK ==========
-  
-  # Логирование - Loki
   loki:
     image: grafana/loki:2.9.2
     ports:
@@ -134,7 +127,6 @@
     restart: unless-stopped
     user: root
 
-  # Сбор логов - Promtail
   promtail:
     image: grafana/promtail:2.9.2
     container_name: promtail
@@ -148,7 +140,6 @@
       - loki
     restart: unless-stopped
 
-  # Метрики - Prometheus
   prometheus:
     image: prom/prometheus:latest
     container_name: prometheus
@@ -168,19 +159,17 @@
       - microservices-net
     restart: unless-stopped
 
-  # Трассировка - Jaeger
   jaeger:
     image: jaegertracing/all-in-one:latest
     ports:
-      - "16686:16686"  # UI
-      - "14268:14268"  # HTTP collector
+      - "16686:16686"
+      - "14268:14268"
     environment:
       - COLLECTOR_OTLP_ENABLED=true
     networks:
       - microservices-net
     restart: unless-stopped
 
-  # Визуализация - Grafana
   grafana:
     image: grafana/grafana:latest
     container_name: grafana

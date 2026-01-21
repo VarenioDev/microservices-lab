@@ -1,18 +1,17 @@
-from fastapi import FastAPI, HTTPException, Depends, status
+from fastapi import FastAPI, HTTPException, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-import jwt
-import time
 from datetime import datetime, timedelta
-import bcrypt
 from typing import Dict
+import jwt
+import bcrypt
 
 from models import UserCreate, UserResponse, Role, Token
 
-app = FastAPI()
+app = FastAPI(title="Auth Service", version="1.0.0")
 security = HTTPBearer()
 
-# Улучшенная "БД" пользователей (в реальном проекте - база данных)
 users_db: Dict[str, dict] = {
     "admin@example.com": {
         "id": "1",
@@ -38,26 +37,25 @@ SECRET_KEY = "your-secret-key-change-in-production"
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
 
+
 class LoginRequest(BaseModel):
     email: str
     password: str
 
+
 def verify_password(plain_password: str, hashed_password: str) -> bool:
     return bcrypt.checkpw(plain_password.encode(), hashed_password.encode())
 
+
 def create_access_token(data: dict, expires_delta: timedelta = None):
     to_encode = data.copy()
-    if expires_delta:
-        expire = datetime.utcnow() + expires_delta
-    else:
-        expire = datetime.utcnow() + timedelta(minutes=15)
+    expire = datetime.utcnow() + (expires_delta or timedelta(minutes=15))
     to_encode.update({"exp": expire, "iat": datetime.utcnow()})
-    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
-    return encoded_jwt
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
 
 @app.post("/register")
 async def register(user_data: UserCreate):
-    """Регистрация нового пользователя"""
     if user_data.email in users_db:
         raise HTTPException(status_code=400, detail="Email already registered")
     
@@ -82,10 +80,11 @@ async def register(user_data: UserCreate):
         is_active=True
     )
 
+
 @app.post("/login")
 async def login(login_data: LoginRequest):
-    """Логин - возвращает JWT токен"""
     user = users_db.get(login_data.email)
+    
     if not user or not verify_password(login_data.password, user["hashed_password"]):
         raise HTTPException(status_code=401, detail="Invalid credentials")
     
@@ -111,10 +110,11 @@ async def login(login_data: LoginRequest):
         user_id=user["id"]
     )
 
+
 @app.get("/verify")
 async def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    """Проверка токена - используется nginx auth_request"""
     token = credentials.credentials
+    
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         email = payload.get("sub")
@@ -124,8 +124,6 @@ async def verify_token(credentials: HTTPAuthorizationCredentials = Depends(secur
         if email not in users_db:
             raise HTTPException(status_code=401, detail="Invalid token")
         
-        # Создаем ответ с заголовками для nginx
-        from fastapi.responses import JSONResponse
         response = JSONResponse({
             "valid": True,
             "user": email,
@@ -133,21 +131,22 @@ async def verify_token(credentials: HTTPAuthorizationCredentials = Depends(secur
             "role": role
         })
         
-        # Устанавливаем заголовки для nginx
         response.headers["X-Auth-User"] = email
         response.headers["X-Auth-Role"] = role
         response.headers["X-Auth-User-Id"] = user_id
         
         return response
+        
     except jwt.ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="Token expired")
     except jwt.InvalidTokenError:
         raise HTTPException(status_code=401, detail="Invalid token")
 
+
 @app.get("/users/me")
 async def read_users_me(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    """Получить информацию о текущем пользователе"""
     token = credentials.credentials
+    
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         email = payload.get("sub")
@@ -165,6 +164,7 @@ async def read_users_me(credentials: HTTPAuthorizationCredentials = Depends(secu
         )
     except:
         raise HTTPException(status_code=401, detail="Invalid token")
+
 
 @app.get("/health")
 def health():

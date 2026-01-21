@@ -1,28 +1,26 @@
-from fastapi import FastAPI, HTTPException, Query, Depends, status, Request
+from fastapi import FastAPI, HTTPException, Query, status, Request
 from fastapi.middleware.cors import CORSMiddleware
 from typing import List, Optional, Dict, Any
-import uuid
 from datetime import datetime
+import uuid
 import asyncio
 import json
 import os
+import time
 import aio_pika
 import httpx
-import time
 
 from models import OrderCreate, OrderUpdate, OrderResponse, UserOrdersResponse, OrderStatus, PaymentStatus
 from prometheus_fastapi_instrumentator import Instrumentator
 
 app = FastAPI(
     title="Order Service API",
-    description="Сервис управления заказами",
     version="1.0.0",
     docs_url="/api/docs",
     redoc_url="/api/redoc",
     openapi_url="/api/openapi.json"
 )
 
-# CORS middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -31,37 +29,32 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Временное хранилище заказов
 orders_db: Dict[str, dict] = {}
 
-# RabbitMQ connection
 RABBITMQ_URL = os.getenv("RABBITMQ_URL", "amqp://guest:guest@rabbitmq:5672/")
 _rabbit_connection = None
 _rabbit_channel = None
 
-# Middleware для логирования
+
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
     start_time = time.time()
-    
     response = await call_next(request)
-    
     process_time = (time.time() - start_time) * 1000
     print(f"{request.method} {request.url.path} - Status: {response.status_code} - Duration: {process_time:.2f}ms")
-    
     return response
 
+
 async def publish_event(routing_key: str, message: dict):
-    """Publish an event to the 'events' exchange"""
     global _rabbit_connection, _rabbit_channel
     if _rabbit_channel is None:
         return
-    
     body = json.dumps(message).encode()
     await _rabbit_channel.default_exchange.publish(
         aio_pika.Message(body=body, content_type="application/json"),
         routing_key=routing_key
     )
+
 
 async def _on_payment_event(message: aio_pika.IncomingMessage):
     async with message.process():
@@ -69,11 +62,13 @@ async def _on_payment_event(message: aio_pika.IncomingMessage):
             payload = json.loads(message.body.decode())
             routing = message.routing_key
             order_id = payload.get("order_id")
+            
             if not order_id or order_id not in orders_db:
                 print(f"Payment event for unknown order {order_id}")
                 return
 
             order = orders_db[order_id]
+            
             if routing == "payment.succeeded":
                 order["payment_status"] = PaymentStatus.PAID.value
                 order["status"] = OrderStatus.PROCESSING.value
@@ -88,14 +83,13 @@ async def _on_payment_event(message: aio_pika.IncomingMessage):
         except Exception as e:
             print(f"Error handling payment event: {e}")
 
+
 async def start_rabbitmq():
     global _rabbit_connection, _rabbit_channel
     try:
         _rabbit_connection = await aio_pika.connect_robust(RABBITMQ_URL)
         _rabbit_channel = await _rabbit_connection.channel()
-
         await _rabbit_channel.declare_exchange("events", aio_pika.ExchangeType.TOPIC)
-
         queue = await _rabbit_channel.declare_queue("order-service.payment-events", durable=True)
         await queue.bind("events", routing_key="payment.*")
         await queue.consume(_on_payment_event)
@@ -103,29 +97,31 @@ async def start_rabbitmq():
     except Exception as e:
         print(f"Could not connect to RabbitMQ: {e}")
 
+
 async def stop_rabbitmq():
     global _rabbit_connection
     if _rabbit_connection:
         await _rabbit_connection.close()
 
-# Helper функции
+
 def generate_order_id():
     return f"ORD-{uuid.uuid4().hex[:8].upper()}"
+
 
 def get_current_time():
     return datetime.utcnow().isoformat()
 
+
 def calculate_total(items: List[Dict]) -> float:
     return sum(item["price"] * item["quantity"] for item in items)
 
-# REST API Endpoints
+
 @app.get("/api/v1/orders", response_model=List[OrderResponse])
 async def get_orders(
-    user_id: Optional[str] = Query(None, description="Фильтр по пользователю"),
-    status: Optional[OrderStatus] = Query(None, description="Фильтр по статусу"),
-    limit: int = Query(100, ge=1, le=500, description="Лимит результатов")
+    user_id: Optional[str] = Query(None),
+    status: Optional[OrderStatus] = Query(None),
+    limit: int = Query(100, ge=1, le=500)
 ):
-    """Получить список заказов с фильтрацией"""
     filtered_orders = list(orders_db.values())
     
     if user_id:
@@ -136,21 +132,21 @@ async def get_orders(
     
     return filtered_orders[:limit]
 
+
 @app.get("/api/v1/orders/{order_id}", response_model=OrderResponse)
 async def get_order(order_id: str):
-    """Получить заказ по ID"""
     order = orders_db.get(order_id)
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
     return order
 
+
 @app.get("/api/v1/orders/user/{user_id}", response_model=UserOrdersResponse)
 async def get_user_orders(
     user_id: str,
-    status: Optional[OrderStatus] = Query(None, description="Фильтр по статусу"),
-    limit: int = Query(50, ge=1, le=200, description="Лимит результатов")
+    status: Optional[OrderStatus] = Query(None),
+    limit: int = Query(50, ge=1, le=200)
 ):
-    """Получить все заказы пользователя"""
     user_orders = [order for order in orders_db.values() if order["user_id"] == user_id]
     
     if status:
@@ -162,9 +158,9 @@ async def get_user_orders(
         user_id=user_id
     )
 
+
 @app.post("/api/v1/orders", response_model=OrderResponse, status_code=status.HTTP_201_CREATED)
 async def create_order(order_data: OrderCreate):
-    """Создать новый заказ"""
     order_id = generate_order_id()
     current_time = get_current_time()
     
@@ -196,15 +192,15 @@ async def create_order(order_data: OrderCreate):
     }))
     return new_order
 
+
 @app.put("/api/v1/orders/{order_id}", response_model=OrderResponse)
 async def update_order(order_id: str, order_update: OrderUpdate):
-    """Обновить заказ"""
     if order_id not in orders_db:
         raise HTTPException(status_code=404, detail="Order not found")
     
     order = orders_db[order_id]
-    
     update_data = order_update.dict(exclude_unset=True)
+    
     for field, value in update_data.items():
         if value is not None:
             if hasattr(value, 'value'):
@@ -213,21 +209,20 @@ async def update_order(order_id: str, order_update: OrderUpdate):
                 order[field] = value
     
     order["updated_at"] = get_current_time()
-    
     return order
+
 
 @app.delete("/api/v1/orders/{order_id}")
 async def delete_order(order_id: str):
-    """Удалить заказ"""
     if order_id not in orders_db:
         raise HTTPException(status_code=404, detail="Order not found")
     
-    deleted_order = orders_db.pop(order_id)
+    orders_db.pop(order_id)
     return {"message": f"Order {order_id} deleted successfully"}
+
 
 @app.get("/api/v1/orders/{order_id}/items")
 async def get_order_items(order_id: str):
-    """Получить товары из заказа"""
     order = orders_db.get(order_id)
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
@@ -239,14 +234,12 @@ async def get_order_items(order_id: str):
         "total_amount": order["total_amount"]
     }
 
-# Метрики для Prometheus
+
 @app.get("/metrics")
 async def metrics():
-    """Эндпоинт для метрик Prometheus"""
-    # Эта функция будет автоматически инструментирована prometheus-fastapi-instrumentator
     pass
 
-# Health check
+
 @app.get("/health")
 async def health_check():
     return {
@@ -254,6 +247,7 @@ async def health_check():
         "service": "order-service",
         "order_count": len(orders_db)
     }
+
 
 @app.get("/")
 async def root():
@@ -263,15 +257,13 @@ async def root():
         "total_orders": len(orders_db)
     }
 
-# Startup / Shutdown events
+
 @app.on_event("startup")
 async def on_startup():
-    # Инициализация Prometheus метрик
     Instrumentator().instrument(app).expose(app)
-    
-    # RabbitMQ подключение
     await asyncio.sleep(2)
     await start_rabbitmq()
+
 
 @app.on_event("shutdown")
 async def on_shutdown():

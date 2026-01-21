@@ -1,4 +1,5 @@
 from fastapi import FastAPI
+from datetime import datetime
 import asyncio
 import os
 import json
@@ -10,15 +11,16 @@ RABBITMQ_URL = os.getenv("RABBITMQ_URL", "amqp://guest:guest@rabbitmq:5672/")
 _conn = None
 _channel = None
 
+
 async def _on_event(message: aio_pika.IncomingMessage):
     async with message.process():
         try:
             payload = json.loads(message.body.decode())
             rk = message.routing_key
-            # Simple notification handling: just log
             print(f"[notification] event={rk} payload={payload}")
         except Exception as e:
             print(f"Error in notification consumer: {e}")
+
 
 async def start_consumer():
     global _conn, _channel
@@ -32,6 +34,7 @@ async def start_consumer():
         print("Notification service connected to RabbitMQ and consuming all events")
     except Exception as e:
         print(f"Notification start error: {e}")
+
 
 async def stop_consumer():
     global _conn

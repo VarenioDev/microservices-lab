@@ -1,7 +1,7 @@
 from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any
-from datetime import datetime
 from enum import Enum
+
 
 class OrderStatus(str, Enum):
     PENDING = "pending"
@@ -11,29 +11,34 @@ class OrderStatus(str, Enum):
     CANCELLED = "cancelled"
     REFUNDED = "refunded"
 
+
 class PaymentStatus(str, Enum):
     PENDING = "pending"
     PAID = "paid"
     FAILED = "failed"
     REFUNDED = "refunded"
 
+
 class OrderItem(BaseModel):
-    product_id: str = Field(..., description="ID товара из Catalog Service")
-    quantity: int = Field(..., gt=0, description="Количество")
-    price: float = Field(..., gt=0, description="Цена за единицу")
-    name: str = Field(..., description="Название товара")
+    product_id: str = Field(...)
+    quantity: int = Field(..., gt=0)
+    price: float = Field(..., gt=0)
+    name: str = Field(...)
+
 
 class OrderCreate(BaseModel):
-    user_id: str = Field(..., description="ID пользователя")
-    items: List[OrderItem] = Field(..., min_items=1, description="Список товаров")
-    shipping_address: Dict[str, Any] = Field(..., description="Адрес доставки")
-    payment_method: str = Field(default="card", description="Метод оплаты")
+    user_id: str = Field(...)
+    items: List[OrderItem] = Field(..., min_items=1)
+    shipping_address: Dict[str, Any] = Field(...)
+    payment_method: str = Field(default="card")
+
 
 class OrderUpdate(BaseModel):
     status: Optional[OrderStatus] = None
     payment_status: Optional[PaymentStatus] = None
     tracking_number: Optional[str] = None
     notes: Optional[str] = None
+
 
 class OrderResponse(BaseModel):
     id: str
@@ -51,6 +56,7 @@ class OrderResponse(BaseModel):
 
     class Config:
         from_attributes = True
+
 
 class UserOrdersResponse(BaseModel):
     orders: List[OrderResponse]

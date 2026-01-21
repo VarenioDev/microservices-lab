@@ -4,7 +4,7 @@ import httpx
 
 CONSUL_ADDR = os.environ.get("CONSUL_ADDR", "http://consul:8500")
 
-app = FastAPI(title="Service Discovery")
+app = FastAPI(title="Service Discovery", version="1.0.0")
 
 
 @app.get("/")
@@ -60,3 +60,8 @@ async def kv_get(key: str):
         if resp.status_code == 404:
             raise HTTPException(status_code=404, detail="Key not found")
         raise HTTPException(status_code=500, detail=resp.text)
+
+
+@app.get("/health")
+async def health():
+    return {"status": "healthy", "service": "service-discovery"}

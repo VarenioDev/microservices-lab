@@ -1,13 +1,11 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from strawberry.fastapi import GraphQLRouter
 import strawberry
 from typing import List, Optional
 import httpx
-import asyncio
 from datetime import datetime
 
-# Настройки сервисов
 SERVICE_URLS = {
     "auth": "http://auth-service:5000",
     "catalog": "http://catalog-service:5000",
@@ -15,7 +13,7 @@ SERVICE_URLS = {
     "payment": "http://payment-service:5000"
 }
 
-# GraphQL типы
+
 @strawberry.type
 class Product:
     id: str
@@ -28,6 +26,7 @@ class Product:
     created_at: str
     updated_at: str
 
+
 @strawberry.type
 class OrderItem:
     product_id: str
@@ -37,7 +36,6 @@ class OrderItem:
     
     @strawberry.field
     async def product(self) -> Optional[Product]:
-        """Получить информацию о товаре"""
         async with httpx.AsyncClient() as client:
             try:
                 response = await client.get(
@@ -61,6 +59,7 @@ class OrderItem:
                 pass
         return None
 
+
 @strawberry.type
 class Order:
     id: str
@@ -78,9 +77,9 @@ class Order:
     
     @strawberry.field
     def address(self) -> str:
-        """Форматированный адрес доставки"""
         addr = self.shipping_address
         return f"{addr.get('street', '')}, {addr.get('city', '')}, {addr.get('country', '')}"
+
 
 @strawberry.type
 class User:
@@ -93,7 +92,6 @@ class User:
     
     @strawberry.field
     async def orders(self) -> List[Order]:
-        """Получить заказы пользователя"""
         async with httpx.AsyncClient() as client:
             try:
                 response = await client.get(
@@ -134,15 +132,13 @@ class User:
                 print(f"Error fetching orders: {e}")
         return []
 
+
 @strawberry.type
 class Query:
     @strawberry.field
     async def user(self, id: str) -> Optional[User]:
-        """Получить пользователя по ID"""
         async with httpx.AsyncClient() as client:
             try:
-                # В реальном приложении здесь бы была аутентификация
-                # Для демо используем фиктивные данные
                 return User(
                     id=id,
                     username=f"user_{id}",
@@ -156,7 +152,6 @@ class Query:
     
     @strawberry.field
     async def product(self, id: str) -> Optional[Product]:
-        """Получить товар по ID"""
         async with httpx.AsyncClient() as client:
             try:
                 response = await client.get(
@@ -189,7 +184,6 @@ class Query:
         search: Optional[str] = None,
         limit: int = 20
     ) -> List[Product]:
-        """Получить список товаров с фильтрацией"""
         async with httpx.AsyncClient() as client:
             try:
                 params = {
@@ -230,10 +224,8 @@ class Query:
     
     @strawberry.field
     async def user_orders(self, user_id: str) -> List[Order]:
-        """Получить все заказы пользователя с деталями товаров"""
         async with httpx.AsyncClient() as client:
             try:
-                # Получаем заказы пользователя
                 orders_response = await client.get(
                     f"{SERVICE_URLS['order']}/api/v1/orders/user/{user_id}",
                     params={"limit": 50},
@@ -244,11 +236,9 @@ class Query:
                     data = orders_response.json()
                     orders = []
                     
-                    # Для каждого заказа создаем объект Order с OrderItems
                     for order_data in data["orders"]:
                         order_items = []
                         
-                        # Создаем OrderItems для каждого товара в заказе
                         for item in order_data["items"]:
                             order_items.append(OrderItem(
                                 product_id=item["product_id"],
@@ -257,7 +247,6 @@ class Query:
                                 name=item["name"]
                             ))
                         
-                        # Создаем Order с OrderItems
                         order = Order(
                             id=order_data["id"],
                             user_id=order_data["user_id"],
@@ -283,7 +272,6 @@ class Query:
     
     @strawberry.field
     async def order(self, id: str) -> Optional[Order]:
-        """Получить заказ по ID"""
         async with httpx.AsyncClient() as client:
             try:
                 response = await client.get(
@@ -294,7 +282,6 @@ class Query:
                 if response.status_code == 200:
                     order_data = response.json()
                     
-                    # Создаем OrderItems
                     order_items = [
                         OrderItem(
                             product_id=item["product_id"],
@@ -305,7 +292,6 @@ class Query:
                         for item in order_data["items"]
                     ]
                     
-                    # Создаем Order
                     return Order(
                         id=order_data["id"],
                         user_id=order_data["user_id"],
@@ -325,16 +311,16 @@ class Query:
         
         return None
 
+
 @strawberry.type
 class Mutation:
     @strawberry.mutation
     async def create_order(
         self,
         user_id: str,
-        items: List[strawberry.scalars.JSON],  # ИЗМЕНЯЕМ ТИП
-        shipping_address: strawberry.scalars.JSON  # ИЗМЕНЯЕМ ТИП
+        items: List[strawberry.scalars.JSON],
+        shipping_address: strawberry.scalars.JSON
     ) -> Optional[Order]:
-        """Создать новый заказ"""
         async with httpx.AsyncClient() as client:
             try:
                 order_data = {
@@ -353,7 +339,6 @@ class Mutation:
                 if response.status_code == 201:
                     order_data = response.json()
                     
-                    # Создаем OrderItems
                     order_items = [
                         OrderItem(
                             product_id=item["product_id"],
@@ -364,7 +349,6 @@ class Mutation:
                         for item in order_data["items"]
                     ]
                     
-                    # Создаем Order
                     return Order(
                         id=order_data["id"],
                         user_id=order_data["user_id"],
@@ -384,17 +368,14 @@ class Mutation:
         
         return None
 
-# Создаем GraphQL схему
+
 schema = strawberry.Schema(query=Query, mutation=Mutation)
 
-# Создаем FastAPI приложение
 app = FastAPI(
     title="GraphQL Gateway",
-    description="GraphQL шлюз для объединения микросервисов",
     version="1.0.0"
 )
 
-# CORS middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -403,11 +384,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Настраиваем GraphQL эндпоинты
 graphql_app = GraphQLRouter(schema, graphiql=True)
 app.include_router(graphql_app, prefix="/graphql")
 
-# REST эндпоинт для проверки
+
 @app.get("/health")
 async def health_check():
     return {
@@ -417,14 +397,14 @@ async def health_check():
         "graphiql": "/graphql"
     }
 
+
 @app.get("/")
 async def root():
     return {
         "message": "GraphQL Gateway",
-        "description": "Объединяет данные из всех микросервисов",
         "endpoints": {
             "graphql": "/graphql",
-            "graphiql": "/graphql (интерактивная IDE)",
+            "graphiql": "/graphql",
             "health": "/health"
         },
         "integrated_services": list(SERVICE_URLS.keys())

@@ -1,21 +1,24 @@
 from pydantic import BaseModel, Field
-from typing import Optional, List, Dict, Any
+from typing import Optional, List
 from enum import Enum
+
 
 class Role(str, Enum):
     ADMIN = "admin"
     USER = "user"
     MANAGER = "manager"
 
-# Заменяем EmailStr на обычную строку с валидацией через Field
+
 class UserBase(BaseModel):
-    email: str = Field(..., description="Email пользователя", pattern=r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$")
+    email: str = Field(..., pattern=r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$")
     full_name: str = Field(..., min_length=2, max_length=100)
     is_active: bool = True
+
 
 class UserCreate(UserBase):
     password: str = Field(..., min_length=6, max_length=100)
     role: Role = Role.USER
+
 
 class UserInDB(UserBase):
     id: str
@@ -24,9 +27,11 @@ class UserInDB(UserBase):
     created_at: str
     last_login: Optional[str] = None
 
+
 class UserResponse(UserBase):
     id: str
     role: Role
+
 
 class Token(BaseModel):
     access_token: str
@@ -35,11 +40,13 @@ class Token(BaseModel):
     role: Role
     user_id: str
 
+
 class TokenData(BaseModel):
     email: Optional[str] = None
     user_id: Optional[str] = None
     role: Optional[Role] = None
     scopes: List[str] = []
+
 
 class Permission(str, Enum):
     READ_CATALOG = "read:catalog"
@@ -50,7 +57,7 @@ class Permission(str, Enum):
     MANAGE_USERS = "manage:users"
     PROCESS_PAYMENTS = "process:payments"
 
-# Ролевые разрешения
+
 ROLE_PERMISSIONS = {
     Role.USER: [
         Permission.READ_CATALOG,
